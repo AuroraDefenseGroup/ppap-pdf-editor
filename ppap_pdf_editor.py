@@ -25,6 +25,14 @@ import re
 import sys
 
 import pymupdf
+try:  # Windows built-in OCR (Windows 10+); the OCR tool is disabled without it
+    import asyncio
+    from winrt.windows.graphics.imaging import BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap
+    from winrt.windows.media.ocr import OcrEngine
+    from winrt.windows.storage.streams import DataWriter
+    OCR_IMPORT_ERROR = None
+except Exception as _ex:  # pragma: no cover - depends on the platform
+    OCR_IMPORT_ERROR = _ex
 from PySide6.QtCore import QPointF, QRectF, QSettings, QSize, Qt, QTimer
 from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QFont,
                            QFontMetricsF, QIcon, QImage, QKeySequence,
@@ -163,6 +171,68 @@ def text_box_size(d):
     h = len(lines) * fm.lineSpacing() * k
     pad = 2.0
     return w + 2 * pad, h + 2 * pad
+
+
+_ocr_engine = None
+
+
+def ocr_engine():
+    """The Windows OCR engine for the user's languages, or raise RuntimeError."""
+    global _ocr_engine
+    if OCR_IMPORT_ERROR is not None:
+        raise RuntimeError(f"Windows OCR is not available on this PC:\n{OCR_IMPORT_ERROR}")
+    if _ocr_engine is None:
+        _ocr_engine = OcrEngine.try_create_from_user_profile_languages()
+        if _ocr_engine is None:
+            raise RuntimeError("Windows has no OCR language installed.\n"
+                               "Add one in Settings > Time & Language > Language "
+                               "(e.g. English with 'Optical character recognition').")
+    return _ocr_engine
+
+
+def ocr_pixmap(pix):
+    """Run Windows OCR on a PyMuPDF RGB pixmap and return the text, one line per row."""
+    n = pix.width * pix.height
+    rgb_bytes = pix.samples
+    bgra = bytearray(n * 4)
+    bgra[0::4] = rgb_bytes[2::3]
+    bgra[1::4] = rgb_bytes[1::3]
+    bgra[2::4] = rgb_bytes[0::3]
+    bgra[3::4] = b"\xff" * n
+    writer = DataWriter()
+    writer.write_bytes(bytes(bgra))
+    bitmap = SoftwareBitmap.create_copy_from_buffer(writer.detach_buffer(), BitmapPixelFormat.BGRA8,
+                                                    pix.width, pix.height, BitmapAlphaMode.PREMULTIPLIED)
+    engine = ocr_engine()
+
+    async def recognize():
+        return await engine.recognize_async(bitmap)
+
+    result = asyncio.run(recognize())
+    return "\n".join(line.text for line in result.lines)
+
+
+def fix_ocr_digits(text):
+    """OCR often reads 0 as the letter O inside numbers (R5.O, 1O.25)."""
+    return re.sub(r"(?<=\d)[Oo]|(?<=\d[.,])[Oo]|(?<![A-Za-z])[Oo](?=[.,]?\d)", "0", text)
+
+
+def ocr_score(text):
+    """How plausible an OCR reading is, used to pick the right orientation.
+
+    Drawing text is upper case (ASME Y14.2), while text read upside down or
+    sideways comes back as lower case letters and stray symbols."""
+    score = 0.0
+    for ch in text:
+        if ch.isupper() or ch.isdigit():
+            score += 1.0
+        elif ch.islower():
+            score += 0.4
+        elif ch in ".,:;/+-±Ø°\"'()#%=<>":
+            score += 0.5
+        elif not ch.isspace():
+            score -= 1.0
+    return score
 
 
 def make_app_icon(size=256):
@@ -743,7 +813,7 @@ ITEM_CLASSES = {"balloon": BalloonItem, "text": TextItem, "rect": RectItem, "lin
 # --------------------------------------------------------------------------
 
 class PdfView(W.QGraphicsView):
-    DRAG_TOOLS = ("balloon", "rect", "remove", "whiteout", "line", "arrow")
+    DRAG_TOOLS = ("balloon", "rect", "remove", "whiteout", "line", "arrow", "ocr")
 
     def __init__(self, win):
         super().__init__(win.scene)
@@ -829,6 +899,8 @@ class PdfView(W.QGraphicsView):
                 it.setBrush(QColor(255, 255, 255, 200))
             elif tool == "remove":
                 it.setBrush(QColor(255, 0, 0, 40))
+            elif tool == "ocr":
+                it.setBrush(QColor(0, 160, 80, 40))
         it.setPen(pen)
         it.setZValue(100)
         self._preview = it
@@ -937,6 +1009,8 @@ class MainWindow(W.QMainWindow):
         ("rect", "Rectangle", "R", "Drag to draw a rectangle."),
         ("arrow", "Arrow", "A", "Drag to draw an arrow."),
         ("line", "Line", "L", "Drag to draw a line."),
+        ("ocr", "OCR Copy", "O", "Drag a box around text (scanned drawings too) to read it with OCR "
+                                 "and copy it to the clipboard."),
     ]
 
     def __init__(self):
@@ -1062,6 +1136,12 @@ class MainWindow(W.QMainWindow):
         m = mb.addMenu("&Tools")
         for a in self.tool_actions.values():
             m.addAction(a)
+        m.addSeparator()
+        self.a_ocr_show = QAction("Show OCR Result Window", self, checkable=True)
+        self.a_ocr_show.setStatusTip("After OCR Copy, show the text so it can be checked and corrected")
+        self.a_ocr_show.setChecked(self.settings.value("ocr_show", "true") == "true")
+        self.a_ocr_show.toggled.connect(lambda v: self.settings.setValue("ocr_show", "true" if v else "false"))
+        m.addAction(self.a_ocr_show)
         m = mb.addMenu("&Help")
         m.addAction("&Quick Guide", self.show_help, "F1")
         m.addAction("&About", self.show_about)
@@ -1107,7 +1187,7 @@ class MainWindow(W.QMainWindow):
         tt.setToolButtonStyle(Qt.ToolButtonTextOnly)
         for key, *_ in self.TOOLS:
             tt.addAction(self.tool_actions[key])
-            if key in ("hand", "balloon", "whiteout"):
+            if key in ("hand", "balloon", "whiteout", "line"):
                 tt.addSeparator()
 
         self.addToolBarBreak()
@@ -1848,6 +1928,8 @@ class MainWindow(W.QMainWindow):
                            "arrow": tool == "arrow"})
         elif tool in ("remove", "whiteout"):
             self.redact_area(pi.index, r, whiteout=(tool == "whiteout"))
+        elif tool == "ocr":
+            self.ocr_area(pi.index, r)
 
     # --------------------------------------------------------- balloon list
     def balloons(self):
@@ -2105,6 +2187,64 @@ class MainWindow(W.QMainWindow):
         self.invalidate_page(i)
         self.clear_find()
 
+    # ---------------------------------------------------------------- OCR
+    def ocr_text(self, i, rect):
+        """OCR a displayed-coordinate area of page i; tries sideways text too."""
+        page = self.doc[i]
+        # get_pixmap's clip is in displayed (rotation-applied) coordinates and the
+        # pixmap comes out as displayed, so the selection rect is used as is
+        clip = pymupdf.Rect(rect.left(), rect.top(), rect.right(), rect.bottom())
+        # ~300 dpi is what OCR likes; keep inside the engine's size limit
+        zoom = min(300 / 72, (OcrEngine.max_image_dimension - 10) / max(clip.width, clip.height, 1))
+        tall = rect.height() > rect.width() * 1.3
+        best = ""
+        for extra in (0, 90, 270):   # 90 / 270 read text that runs sideways on the drawing
+            pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom).prerotate(extra), clip=clip,
+                                  alpha=False, annots=True)
+            text = ocr_pixmap(pix).strip()
+            if ocr_score(text) > ocr_score(best):
+                best = text
+            if extra == 0 and not tall and ocr_score(best) >= 3:
+                break   # horizontal text read fine - skip the sideways attempts
+        return fix_ocr_digits(best)
+
+    def ocr_area(self, i, rect):
+        W.QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            text = self.ocr_text(i, rect)
+        except Exception as ex:
+            W.QApplication.restoreOverrideCursor()
+            W.QMessageBox.warning(self, APP_NAME, f"OCR failed:\n{ex}")
+            return
+        W.QApplication.restoreOverrideCursor()
+        if not text:
+            self.statusBar().showMessage("OCR found no text in that area. Try a tighter box around the text.",
+                                         6000)
+            return
+        W.QApplication.clipboard().setText(text)
+        preview = text.replace("\n", "  ")
+        self.statusBar().showMessage(f"Copied to clipboard: {preview[:120]}", 8000)
+        if self.a_ocr_show.isChecked():
+            self.show_ocr_result(text)
+
+    def show_ocr_result(self, text):
+        dlg = W.QDialog(self)
+        dlg.setWindowTitle("OCR Result - copied to clipboard")
+        lay = W.QVBoxLayout(dlg)
+        lay.addWidget(W.QLabel("This text is on the clipboard. Correct it here and click "
+                               "Copy to replace the clipboard text."))
+        edit = W.QPlainTextEdit(text)
+        edit.setMinimumSize(420, 140)
+        lay.addWidget(edit)
+        bb = W.QDialogButtonBox()
+        copy_btn = bb.addButton("Copy", W.QDialogButtonBox.AcceptRole)
+        copy_btn.setDefault(True)
+        bb.addButton("Close", W.QDialogButtonBox.RejectRole)
+        bb.accepted.connect(lambda: (W.QApplication.clipboard().setText(edit.toPlainText()), dlg.accept()))
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        dlg.exec()
+
     # ---------------------------------------------------------------- find
     def focus_find(self):
         self.find_edit.setFocus()
@@ -2169,6 +2309,8 @@ Notes directly in the Balloon List, then File &gt; Export Balloon List
 Edit Text (E): click existing PDF text to change it.<br>
 Remove Text (X): drag a box to delete the PDF text inside it.<br>
 Whiteout (W): drag a box to erase everything inside (also works on scans).<br>
+OCR Copy (O): drag a box around any text, including scanned drawings, to
+read it and copy it to the clipboard. Sideways text is handled too.<br>
 Add Text (T): click to add a text box.<br><br>
 <b>Saving</b><br>
 Save keeps markups editable (they are standard PDF annotations, so

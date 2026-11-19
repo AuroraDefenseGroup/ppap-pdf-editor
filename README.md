@@ -13,6 +13,7 @@ You can also drag a PDF onto the window, or right-click a PDF, choose "Open with
 - **Edit Text (E):** click existing PDF text to retype it or change its size and colour.
 - **Remove Text (X):** drag a box to delete PDF text; lines and graphics stay.
 - **Whiteout (W):** drag a box to erase everything inside it. This also works on scanned drawings.
+- **OCR Copy (O):** drag a box around any text, including on scanned drawings, to read it with Windows' built-in OCR and copy it to the clipboard. Sideways text is handled, and a window shows the result so you can correct it (turn that off under Tools > Show OCR Result Window).
 - **Add Text (T), Rectangle (R), Arrow (A), Line (L).**
 - Undo/redo (Ctrl+Z / Ctrl+Y) covers everything, including text edits.
 
